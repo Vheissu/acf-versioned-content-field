@@ -23,7 +23,7 @@
 
 - Tests cover saving, history, signatures, formatting, validation, REST schema, rendering and plugin setup.
 - Added PHPStan (level 8) and PHPCS (PSR-12) config, and a GitHub Actions workflow.
-- Dev dependencies now install on PHP 8.1 to 8.5.
+- Dev dependencies install on PHP 8.2 to 8.5. CI runs the tests there and checks syntax on PHP 8.1.
 
 ## 1.0.0
 

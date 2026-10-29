@@ -123,7 +123,7 @@ composer phpcs     # Coding standards (PSR-12)
 composer check     # All of the above
 ```
 
-Tests use [Brain Monkey](https://github.com/Brain-WP/BrainMonkey) to stub WordPress and ACF functions, so they run without a WordPress install. CI runs them on PHP 8.1 to 8.4.
+Tests use [Brain Monkey](https://github.com/Brain-WP/BrainMonkey) to stub WordPress and ACF functions, so they run without a WordPress install. CI runs them on PHP 8.2 to 8.5 and checks syntax on PHP 8.1. The test tools no longer install on PHP 8.1.
 
 ## License
 
