@@ -5,38 +5,57 @@ declare(strict_types=1);
 namespace AcfVersionedContentField\Fields;
 
 /**
- * ACF Versioned Content field type.
+ * ACF field type that keeps a history of previous content.
+ *
+ * The stored value is an array holding the current version and a newest-first
+ * list of previous versions. A new version is recorded only when the content
+ * changes, and history is always rebuilt on the server: the form submits the
+ * new content and an optional change note, plus a signed copy of the history
+ * it was rendered with so rows keep their own history when a repeater is
+ * reordered.
+ *
+ * @phpstan-type Version array{
+ *     id: string,
+ *     content: string,
+ *     note: string,
+ *     author_id: int,
+ *     author_name: string,
+ *     created_at: string
+ * }
+ * @phpstan-type History array{current: Version, versions: list<Version>}
  */
 class VersionedContentField extends \acf_field
 {
+    public const TYPE = 'versioned_content';
+
+    private const TEXT_DOMAIN = 'acf-versioned-content-field';
+    private const PREVIEW_LENGTH = 240;
+
     private string $plugin_file;
-
-    /**
-     * @var array<string, mixed>
-     */
-    public $settings = [];
-
-    /**
-     * @var array<string, mixed>
-     */
-    public $defaults = [];
 
     public function __construct(string $plugin_file)
     {
         $this->plugin_file = $plugin_file;
 
-        $this->name = 'versioned_content';
-        $this->label = __('Versioned Content', 'acf-versioned-content-field');
+        parent::__construct();
+    }
+
+    /**
+     * Set up the field type. Called by the acf_field constructor.
+     */
+    public function initialize(): void
+    {
+        $this->name = self::TYPE;
+        $this->label = __('Versioned Content', self::TEXT_DOMAIN);
         $this->category = 'content';
+        $this->description = __('A textarea that keeps a history of previous content.', self::TEXT_DOMAIN);
         $this->defaults = [
             'max_versions' => 10,
             'return_format' => 'current',
             'rows' => 8,
-            'enable_notes' => true,
-            'show_history' => true,
+            'enable_notes' => 1,
+            'show_history' => 1,
         ];
-
-        parent::__construct();
     }
 
     /**
@@ -47,147 +66,132 @@ class VersionedContentField extends \acf_field
     public function render_field_settings(array $field): void
     {
         acf_render_field_setting($field, [
-            'label' => __('Max Versions', 'acf-versioned-content-field'),
-            'instructions' => __('Limit the number of previous versions kept. Use 0 for unlimited.', 'acf-versioned-content-field'),
+            'label' => __('Max Versions', self::TEXT_DOMAIN),
+            'instructions' => __('Limit the number of previous versions kept. Use 0 for unlimited.', self::TEXT_DOMAIN),
             'type' => 'number',
             'name' => 'max_versions',
             'min' => 0,
             'step' => 1,
-            'default_value' => $this->defaults['max_versions'],
         ]);
 
         acf_render_field_setting($field, [
-            'label' => __('Return Format', 'acf-versioned-content-field'),
-            'instructions' => __('Choose what value is returned by get_field().', 'acf-versioned-content-field'),
+            'label' => __('Return Format', self::TEXT_DOMAIN),
+            'instructions' => __('Choose what value is returned by get_field().', self::TEXT_DOMAIN),
             'type' => 'select',
             'name' => 'return_format',
             'choices' => [
-                'current' => __('Current content only', 'acf-versioned-content-field'),
-                'all' => __('Current content + version history', 'acf-versioned-content-field'),
+                'current' => __('Current content only', self::TEXT_DOMAIN),
+                'all' => __('Current content + version history', self::TEXT_DOMAIN),
             ],
-            'default_value' => $this->defaults['return_format'],
             'ui' => 1,
         ]);
 
         acf_render_field_setting($field, [
-            'label' => __('Rows', 'acf-versioned-content-field'),
-            'instructions' => __('Textarea rows for the editor.', 'acf-versioned-content-field'),
+            'label' => __('Rows', self::TEXT_DOMAIN),
+            'instructions' => __('Textarea rows for the editor.', self::TEXT_DOMAIN),
             'type' => 'number',
             'name' => 'rows',
             'min' => 3,
             'step' => 1,
-            'default_value' => $this->defaults['rows'],
         ]);
 
         acf_render_field_setting($field, [
-            'label' => __('Enable Change Notes', 'acf-versioned-content-field'),
-            'instructions' => __('Allow editors to add a change note for each version.', 'acf-versioned-content-field'),
+            'label' => __('Enable Change Notes', self::TEXT_DOMAIN),
+            'instructions' => __('Allow editors to add a change note for each version.', self::TEXT_DOMAIN),
             'type' => 'true_false',
             'name' => 'enable_notes',
             'ui' => 1,
-            'default_value' => 1,
         ]);
 
         acf_render_field_setting($field, [
-            'label' => __('Show Version History', 'acf-versioned-content-field'),
-            'instructions' => __('Display previous versions in the editor UI.', 'acf-versioned-content-field'),
+            'label' => __('Show Version History', self::TEXT_DOMAIN),
+            'instructions' => __('Display previous versions in the editor UI.', self::TEXT_DOMAIN),
             'type' => 'true_false',
             'name' => 'show_history',
             'ui' => 1,
-            'default_value' => 1,
         ]);
     }
 
     /**
-     * Render field input.
+     * Render the field input.
      *
      * @param array<string, mixed> $field
      */
     public function render_field(array $field): void
     {
         $field = wp_parse_args($field, $this->defaults);
-        $value = $this->normalize_value($field['value'] ?? null);
+        $history = $this->normalize_value($field['value'] ?? null);
+        $state = $this->encode_state($history);
 
-        $current = $value['current'];
-        $versions = $value['versions'];
-        $rows = (int) $field['rows'];
-        $enable_notes = (bool) $field['enable_notes'];
-        $show_history = (bool) $field['show_history'];
-
-        $field_name = esc_attr($field['name']);
-        $current_content = $current['content'];
-        $current_note = $current['note'];
-
+        $name = (string) $field['name'];
+        $note_id = ((string) ($field['id'] ?? $field['key'] ?? '')) . '-note';
+        $current = $history['current'];
+        $versions = $history['versions'];
+        $total = count($versions);
         $last_saved = $this->format_version_meta($current);
         ?>
-        <div class="acf-versioned-content-field" data-field-key="<?php echo esc_attr((string) ($field['key'] ?? '')); ?>">
+        <div class="acf-versioned-content-field">
             <div class="acf-versioned-content-editor">
                 <label class="acf-versioned-content-label">
-                    <strong><?php echo esc_html__('Current Content', 'acf-versioned-content-field'); ?></strong>
-                    <?php if ($last_saved !== ''): ?>
+                    <strong><?php echo esc_html__('Current Content', self::TEXT_DOMAIN); ?></strong>
+                    <?php if ($last_saved !== '') : ?>
                         <span class="acf-versioned-content-meta"><?php echo esc_html($last_saved); ?></span>
                     <?php endif; ?>
                 </label>
                 <textarea
                     class="acf-versioned-content-textarea"
-                    name="<?php echo $field_name; ?>[current][content]"
-                    rows="<?php echo esc_attr((string) $rows); ?>"
+                    name="<?php echo esc_attr($name); ?>[content]"
+                    rows="<?php echo esc_attr((string) (int) $field['rows']); ?>"
                     data-role="current-content"
-                ><?php echo esc_textarea($current_content); ?></textarea>
-                <input type="hidden" name="<?php echo $field_name; ?>[current][id]" value="<?php echo esc_attr($current['id']); ?>" />
-                <input type="hidden" name="<?php echo $field_name; ?>[current][created_at]" value="<?php echo esc_attr($current['created_at']); ?>" />
-                <input type="hidden" name="<?php echo $field_name; ?>[current][author_id]" value="<?php echo esc_attr((string) $current['author_id']); ?>" />
-                <input type="hidden" name="<?php echo $field_name; ?>[current][author_name]" value="<?php echo esc_attr($current['author_name']); ?>" />
-                <input type="hidden" name="<?php echo $field_name; ?>[current][note]" value="<?php echo esc_attr($current_note); ?>" />
-                <input type="hidden" name="<?php echo $field_name; ?>[current_original]" value="<?php echo esc_attr($current_content); ?>" />
+                ><?php echo esc_textarea($current['content']); ?></textarea>
+                <input type="hidden" name="<?php echo esc_attr($name); ?>[state]" value="<?php echo esc_attr($state); ?>" />
+                <input type="hidden" name="<?php echo esc_attr($name); ?>[signature]" value="<?php echo esc_attr($this->sign_state($state, $field)); ?>" />
             </div>
 
-            <?php if ($enable_notes): ?>
+            <?php if ((bool) $field['enable_notes']) : ?>
                 <div class="acf-versioned-content-note">
-                    <label for="<?php echo esc_attr($field['id'] ?? $field['key']); ?>-note">
-                        <?php echo esc_html__('Change Note', 'acf-versioned-content-field'); ?>
+                    <label for="<?php echo esc_attr($note_id); ?>">
+                        <?php echo esc_html__('Change Note', self::TEXT_DOMAIN); ?>
                     </label>
                     <input
                         type="text"
                         class="acf-versioned-content-note-input"
-                        id="<?php echo esc_attr($field['id'] ?? $field['key']); ?>-note"
-                        name="<?php echo $field_name; ?>[note]"
+                        id="<?php echo esc_attr($note_id); ?>"
+                        name="<?php echo esc_attr($name); ?>[note]"
                         value=""
-                        placeholder="<?php echo esc_attr__('Describe what changed (optional)', 'acf-versioned-content-field'); ?>"
+                        placeholder="<?php echo esc_attr__('Describe what changed (optional)', self::TEXT_DOMAIN); ?>"
                         data-role="change-note"
                     />
                 </div>
             <?php endif; ?>
 
-            <?php if ($show_history): ?>
-                <div class="acf-versioned-content-history" data-max-versions="<?php echo esc_attr((string) $field['max_versions']); ?>">
+            <?php if ((bool) $field['show_history']) : ?>
+                <div class="acf-versioned-content-history">
                     <div class="acf-versioned-content-history-header">
-                        <strong><?php echo esc_html__('Version History', 'acf-versioned-content-field'); ?></strong>
+                        <strong><?php echo esc_html__('Version History', self::TEXT_DOMAIN); ?></strong>
                         <span class="acf-versioned-content-history-count">
                             <?php
-                            echo esc_html(
-                                sprintf(
-                                    /* translators: %d: number of versions */
-                                    __('%d previous versions', 'acf-versioned-content-field'),
-                                    count($versions)
-                                )
-                            );
+                            echo esc_html(sprintf(
+                                /* translators: %d: number of previous versions */
+                                _n('%d previous version', '%d previous versions', $total, self::TEXT_DOMAIN),
+                                $total
+                            ));
                             ?>
                         </span>
                     </div>
-                    <?php if (empty($versions)): ?>
+                    <?php if ($total === 0) : ?>
                         <p class="acf-versioned-content-empty">
-                            <?php echo esc_html__('No previous versions yet.', 'acf-versioned-content-field'); ?>
+                            <?php echo esc_html__('No previous versions yet.', self::TEXT_DOMAIN); ?>
                         </p>
-                    <?php else: ?>
+                    <?php else : ?>
                         <ul class="acf-versioned-content-versions">
-                            <?php foreach ($versions as $index => $version): ?>
+                            <?php foreach ($versions as $index => $version) : ?>
                                 <li class="acf-versioned-content-version" data-version>
                                     <div class="acf-versioned-content-version-meta" data-role="version-meta" data-summary="<?php echo esc_attr($this->format_version_meta($version)); ?>">
                                         <span class="acf-versioned-content-version-title">
-                                            <?php echo esc_html($this->format_version_label($version, $index)); ?>
+                                            <?php echo esc_html($this->format_version_label($version, $total - $index)); ?>
                                         </span>
-                                        <?php if (!empty($version['note'])): ?>
+                                        <?php if ($version['note'] !== '') : ?>
                                             <span class="acf-versioned-content-version-note">
                                                 <?php echo esc_html($version['note']); ?>
                                             </span>
@@ -195,19 +199,14 @@ class VersionedContentField extends \acf_field
                                     </div>
                                     <div class="acf-versioned-content-version-actions">
                                         <button type="button" class="button button-small" data-action="restore-version">
-                                            <?php echo esc_html__('Restore', 'acf-versioned-content-field'); ?>
+                                            <?php echo esc_html__('Restore', self::TEXT_DOMAIN); ?>
                                         </button>
                                     </div>
                                     <details class="acf-versioned-content-version-preview">
-                                        <summary><?php echo esc_html__('Preview', 'acf-versioned-content-field'); ?></summary>
+                                        <summary><?php echo esc_html__('Preview', self::TEXT_DOMAIN); ?></summary>
                                         <pre><?php echo esc_html($this->trim_preview($version['content'])); ?></pre>
                                     </details>
-                                    <input type="hidden" name="<?php echo $field_name; ?>[versions][<?php echo esc_attr((string) $index); ?>][id]" value="<?php echo esc_attr($version['id']); ?>" />
-                                    <input type="hidden" name="<?php echo $field_name; ?>[versions][<?php echo esc_attr((string) $index); ?>][content]" value="<?php echo esc_attr($version['content']); ?>" data-role="version-content" />
-                                    <input type="hidden" name="<?php echo $field_name; ?>[versions][<?php echo esc_attr((string) $index); ?>][note]" value="<?php echo esc_attr($version['note']); ?>" />
-                                    <input type="hidden" name="<?php echo $field_name; ?>[versions][<?php echo esc_attr((string) $index); ?>][author_id]" value="<?php echo esc_attr((string) $version['author_id']); ?>" />
-                                    <input type="hidden" name="<?php echo $field_name; ?>[versions][<?php echo esc_attr((string) $index); ?>][author_name]" value="<?php echo esc_attr($version['author_name']); ?>" />
-                                    <input type="hidden" name="<?php echo $field_name; ?>[versions][<?php echo esc_attr((string) $index); ?>][created_at]" value="<?php echo esc_attr($version['created_at']); ?>" />
+                                    <textarea hidden readonly data-role="version-content"><?php echo esc_textarea($version['content']); ?></textarea>
                                 </li>
                             <?php endforeach; ?>
                         </ul>
@@ -219,11 +218,11 @@ class VersionedContentField extends \acf_field
     }
 
     /**
-     * Enqueue scripts/styles for the input UI.
+     * Enqueue scripts and styles for the input UI.
      */
     public function input_admin_enqueue_scripts(): void
     {
-        $version = defined('ACF_VERSIONED_CONTENT_FIELD_VERSION') ? ACF_VERSIONED_CONTENT_FIELD_VERSION : '1.0.0';
+        $version = defined('ACF_VERSIONED_CONTENT_FIELD_VERSION') ? ACF_VERSIONED_CONTENT_FIELD_VERSION : false;
         $url = plugin_dir_url($this->plugin_file);
 
         wp_register_script(
@@ -243,7 +242,7 @@ class VersionedContentField extends \acf_field
 
         wp_localize_script('acf-versioned-content-field-input', 'acfVersionedContentField', [
             'i18n' => [
-                'restoredNote' => __('Restored previous version', 'acf-versioned-content-field'),
+                'restoredNote' => __('Restored previous version', self::TEXT_DOMAIN),
             ],
         ]);
 
@@ -252,87 +251,89 @@ class VersionedContentField extends \acf_field
     }
 
     /**
-     * Prepare value for saving.
+     * Build the value to store, recording a new version when the content changes.
      *
-     * @param mixed $value
+     * Accepts the editor form submission, a plain string (e.g. from update_field()),
+     * or a full history array (e.g. from the REST API). Only the content and note are
+     * taken from the input; previous versions always come from the signed form state
+     * or the stored value, so history can't be rewritten through this method.
+     *
+     * @param mixed $value Slashed input, as WordPress passes it to meta functions.
      * @param int|string $post_id
      * @param array<string, mixed> $field
-     * @return array<string, mixed>|string
+     * @return array<string, mixed>|string The history array, slashed for update_metadata(), or '' when empty.
      */
     public function update_value($value, $post_id, array $field)
     {
         $field = wp_parse_args($field, $this->defaults);
-        $raw = is_array($value) ? $value : [];
+        $value = wp_unslash($value);
 
-        $current_input = $this->sanitize_content($raw['current']['content'] ?? '');
-        $current_original = $this->sanitize_content($raw['current_original'] ?? ($raw['current']['content'] ?? ''));
-        $note = $this->sanitize_note($raw['note'] ?? '');
+        $content = $this->sanitize_content($this->extract_content($value));
+        $note = is_array($value) ? $this->sanitize_note($value['note'] ?? '') : '';
 
-        $current = $this->sanitize_version($raw['current'] ?? []);
-        $current['content'] = $current_original;
+        $history = $this->submitted_history($value, $field) ?? $this->stored_history($post_id, $field);
+        $current = $history['current'];
 
-        $versions = $this->sanitize_versions($raw['versions'] ?? []);
+        if ($content !== $current['content']) {
+            if ($current['content'] !== '') {
+                $history['versions'] = [$current, ...$history['versions']];
+            }
+            $history['current'] = $this->new_version($content, $note);
+        } elseif ($content !== '' && $current['id'] === '') {
+            // Content saved before this field type was used (e.g. as a textarea) has no metadata yet.
+            $history['current'] = $this->new_version($content, $note);
+        }
 
-        if ($current_input === '' && $current_original === '' && empty($versions)) {
+        if ($history['current']['content'] === '' && $history['versions'] === []) {
             return '';
         }
 
-        $current_changed = $current_input !== $current_original;
-
-        if ($current_changed) {
-            if ($current_original !== '') {
-                $versions = $this->prepend_version($current, $versions);
-            }
-            $current = $this->build_version_entry($current_input, $note);
-        } else {
-            if ($current_input !== '' && $current['id'] === '') {
-                $current = $this->build_version_entry(
-                    $current_input,
-                    $note,
-                    $current['author_id'] > 0 ? $current['author_id'] : null,
-                    $current['created_at'] !== '' ? $current['created_at'] : null,
-                    $current['id'] !== '' ? $current['id'] : null,
-                    $current['author_name'] !== '' ? $current['author_name'] : null
-                );
-            } else {
-                $current['content'] = $current_input;
-            }
+        $max_versions = (int) $field['max_versions'];
+        if ($max_versions > 0) {
+            $history['versions'] = array_slice($history['versions'], 0, $max_versions);
         }
 
-        $versions = $this->trim_versions($versions, (int) $field['max_versions']);
-
-        return [
-            'current' => $current,
-            'versions' => array_values($versions),
-        ];
+        return wp_slash($history);
     }
 
     /**
-     * Format value for frontend.
+     * Format the stored value for templates.
      *
      * @param mixed $value
      * @param int|string $post_id
      * @param array<string, mixed> $field
-     * @return mixed
+     * @return History|string|null
      */
     public function format_value($value, $post_id, array $field)
     {
-        if ($value === '' || $value === null) {
+        if ($value === '' || $value === null || $value === false) {
             return null;
         }
 
-        $normalized = $this->normalize_value($value);
-        $return_format = $field['return_format'] ?? $this->defaults['return_format'];
+        $history = $this->normalize_value($value);
 
-        if ($return_format === 'current') {
-            return $normalized['current']['content'] ?? '';
+        if (($field['return_format'] ?? $this->defaults['return_format']) === 'all') {
+            return $history;
         }
 
-        return $normalized;
+        return $history['current']['content'];
     }
 
     /**
-     * Validate the field value.
+     * Format the stored value for REST API responses so they match get_rest_schema().
+     *
+     * @param mixed $value
+     * @param int|string $post_id
+     * @param array<string, mixed> $field
+     * @return History|string|null
+     */
+    public function format_value_for_rest($value, $post_id, array $field)
+    {
+        return $this->format_value($value, $post_id, $field);
+    }
+
+    /**
+     * Validate the submitted value.
      *
      * @param bool|string $valid
      * @param mixed $value
@@ -340,23 +341,14 @@ class VersionedContentField extends \acf_field
      * @param string $input
      * @return bool|string
      */
-    public function validate_value($valid, $value, array $field, string $input)
+    public function validate_value($valid, $value, array $field, $input)
     {
-        if ($valid !== true) {
+        if ($valid !== true || empty($field['required'])) {
             return $valid;
         }
 
-        if (!empty($field['required'])) {
-            $content = '';
-            if (is_array($value)) {
-                $content = (string) ($value['current']['content'] ?? '');
-            } elseif (is_string($value)) {
-                $content = $value;
-            }
-
-            if (trim($content) === '') {
-                return __('Please enter content.', 'acf-versioned-content-field');
-            }
+        if (trim($this->extract_content($value)) === '') {
+            return __('Please enter content.', self::TEXT_DOMAIN);
         }
 
         return $valid;
@@ -370,22 +362,21 @@ class VersionedContentField extends \acf_field
      */
     public function get_rest_schema(array $field): array
     {
-        $return_format = $field['return_format'] ?? $this->defaults['return_format'];
-
-        if ($return_format === 'current') {
+        if (($field['return_format'] ?? $this->defaults['return_format']) !== 'all') {
             return [
-                'type' => 'string',
-                'description' => __('Current version content.', 'acf-versioned-content-field'),
+                'type' => ['string', 'null'],
+                'description' => __('Current version content.', self::TEXT_DOMAIN),
             ];
         }
 
         return [
-            'type' => 'object',
+            'type' => ['object', 'null'],
             'properties' => [
-                'current' => $this->get_version_schema(__('Current version.', 'acf-versioned-content-field')),
+                'current' => $this->get_version_schema(__('Current version.', self::TEXT_DOMAIN)),
                 'versions' => [
                     'type' => 'array',
-                    'items' => $this->get_version_schema(__('Historical version.', 'acf-versioned-content-field')),
+                    'description' => __('Previous versions, newest first.', self::TEXT_DOMAIN),
+                    'items' => $this->get_version_schema(__('Previous version.', self::TEXT_DOMAIN)),
                 ],
             ],
         ];
@@ -411,209 +402,181 @@ class VersionedContentField extends \acf_field
     }
 
     /**
+     * Pull the new content out of any supported input shape.
+     *
      * @param mixed $value
-     * @return array<string, mixed>
+     */
+    private function extract_content($value): string
+    {
+        if (is_array($value)) {
+            $value = $value['content'] ?? $value['current']['content'] ?? '';
+        }
+
+        return is_scalar($value) ? (string) $value : '';
+    }
+
+    /**
+     * History the form was rendered with, if its signature checks out.
+     *
+     * @param mixed $value
+     * @param array<string, mixed> $field
+     * @return History|null
+     */
+    private function submitted_history($value, array $field): ?array
+    {
+        if (!is_array($value) || !is_string($value['state'] ?? null) || !is_string($value['signature'] ?? null)) {
+            return null;
+        }
+
+        if (!hash_equals($this->sign_state($value['state'], $field), $value['signature'])) {
+            return null;
+        }
+
+        $decoded = json_decode((string) base64_decode($value['state'], true), true);
+
+        return is_array($decoded) ? $this->normalize_value($decoded) : null;
+    }
+
+    /**
+     * @param int|string $post_id
+     * @param array<string, mixed> $field
+     * @return History
+     */
+    private function stored_history($post_id, array $field): array
+    {
+        $stored = function_exists('acf_get_metadata_by_field')
+            ? acf_get_metadata_by_field($post_id, $field)
+            : acf_get_metadata($post_id, (string) $field['name']);
+
+        return $this->normalize_value($stored);
+    }
+
+    /**
+     * @param History $history
+     */
+    private function encode_state(array $history): string
+    {
+        $json = wp_json_encode($history);
+
+        return $json === false ? '' : base64_encode($json);
+    }
+
+    /**
+     * @param array<string, mixed> $field
+     */
+    private function sign_state(string $state, array $field): string
+    {
+        return wp_hash(self::TYPE . '|' . ($field['key'] ?? '') . '|' . $state);
+    }
+
+    /**
+     * Coerce a stored value into a complete history array.
+     *
+     * Plain strings are treated as current content with no metadata, which covers
+     * values saved before the field was switched to this type.
+     *
+     * @param mixed $value
+     * @return History
      */
     private function normalize_value($value): array
     {
-        if (is_string($value)) {
-            $current = $this->empty_version();
-            $current['content'] = $this->sanitize_content($value);
-
-            return [
-                'current' => $current,
-                'versions' => [],
-            ];
+        if (is_scalar($value) && !is_bool($value)) {
+            $value = ['current' => ['content' => (string) $value]];
         }
 
         if (!is_array($value)) {
-            return [
-                'current' => $this->empty_version(),
-                'versions' => [],
-            ];
+            $value = [];
         }
 
-        $current = $this->sanitize_version($value['current'] ?? []);
-        $current['content'] = $this->sanitize_content($value['current']['content'] ?? $current['content']);
+        $versions = [];
+        foreach (is_array($value['versions'] ?? null) ? $value['versions'] : [] as $version) {
+            $version = $this->normalize_version($version);
+            if ($version['content'] !== '') {
+                $versions[] = $version;
+            }
+        }
 
         return [
-            'current' => $current,
-            'versions' => $this->sanitize_versions($value['versions'] ?? []),
+            'current' => $this->normalize_version($value['current'] ?? []),
+            'versions' => $versions,
         ];
     }
 
     /**
-     * @param array<string, mixed> $version
-     * @return array<string, mixed>
+     * @param mixed $version
+     * @return Version
      */
-    private function sanitize_version(array $version): array
+    private function normalize_version($version): array
     {
+        $version = is_array($version) ? $version : [];
+
         return [
-            'id' => $this->sanitize_id($version['id'] ?? ''),
-            'content' => $this->sanitize_content($version['content'] ?? ''),
-            'note' => $this->sanitize_note($version['note'] ?? ''),
-            'author_id' => (int) ($version['author_id'] ?? 0),
-            'author_name' => $this->sanitize_note($version['author_name'] ?? ''),
-            'created_at' => $this->sanitize_note($version['created_at'] ?? ''),
+            'id' => $this->to_string($version['id'] ?? ''),
+            'content' => $this->to_string($version['content'] ?? ''),
+            'note' => $this->to_string($version['note'] ?? ''),
+            'author_id' => (int) $this->to_string($version['author_id'] ?? 0),
+            'author_name' => $this->to_string($version['author_name'] ?? ''),
+            'created_at' => $this->to_string($version['created_at'] ?? ''),
         ];
     }
 
     /**
-     * @param array<int|string, mixed> $versions
-     * @return array<int, array<string, mixed>>
+     * @return Version
      */
-    private function sanitize_versions($versions): array
+    private function new_version(string $content, string $note): array
     {
-        if (!is_array($versions)) {
-            return [];
-        }
-
-        $sanitized = [];
-        foreach ($versions as $version) {
-            if (!is_array($version)) {
-                continue;
-            }
-            $entry = $this->sanitize_version($version);
-            if ($entry['content'] === '') {
-                continue;
-            }
-            $sanitized[] = $entry;
-        }
-
-        return $sanitized;
-    }
-
-    /**
-     * @param array<string, mixed> $version
-     * @param array<int, array<string, mixed>> $versions
-     * @return array<int, array<string, mixed>>
-     */
-    private function prepend_version(array $version, array $versions): array
-    {
-        $entry = $this->sanitize_version($version);
-        if ($entry['content'] === '') {
-            return $versions;
-        }
-
-        array_unshift($versions, $entry);
-        return $versions;
-    }
-
-    /**
-     * @param array<int, array<string, mixed>> $versions
-     * @return array<int, array<string, mixed>>
-     */
-    private function trim_versions(array $versions, int $max): array
-    {
-        if ($max <= 0) {
-            return $versions;
-        }
-
-        return array_slice($versions, 0, $max);
-    }
-
-    /**
-     * @return array<string, mixed>
-     */
-    private function build_version_entry(
-        string $content,
-        string $note,
-        ?int $author_id = null,
-        ?string $created_at = null,
-        ?string $id = null,
-        ?string $author_name = null
-    ): array {
-        $author_id = $author_id ?? (int) get_current_user_id();
-        $author_name = $author_name ?? $this->get_author_name($author_id);
+        $author_id = get_current_user_id();
+        $author = $author_id > 0 ? get_userdata($author_id) : false;
 
         return [
-            'id' => $id ?? $this->generate_id(),
-            'content' => $this->sanitize_content($content),
-            'note' => $this->sanitize_note($note),
+            'id' => wp_generate_uuid4(),
+            'content' => $content,
+            'note' => $note,
             'author_id' => $author_id,
-            'author_name' => $this->sanitize_note($author_name),
-            'created_at' => $created_at ?? current_time('mysql'),
+            'author_name' => $author ? $author->display_name : '',
+            'created_at' => current_time('mysql'),
         ];
     }
 
     /**
-     * @return array<string, mixed>
+     * @param mixed $value
      */
-    private function empty_version(): array
-    {
-        return [
-            'id' => '',
-            'content' => '',
-            'note' => '',
-            'author_id' => 0,
-            'author_name' => '',
-            'created_at' => '',
-        ];
-    }
-
     private function sanitize_content($value): string
     {
-        if (!is_string($value)) {
-            return '';
-        }
+        $content = str_replace(["\r\n", "\r"], "\n", $this->to_string($value));
 
-        $value = wp_unslash($value);
-        return wp_kses_post($value);
-    }
-
-    private function sanitize_note($value): string
-    {
-        if (!is_string($value)) {
-            return '';
-        }
-
-        return sanitize_text_field(wp_unslash($value));
-    }
-
-    private function sanitize_id($value): string
-    {
-        if (!is_string($value)) {
-            return '';
-        }
-
-        return sanitize_text_field($value);
-    }
-
-    private function generate_id(): string
-    {
-        if (function_exists('wp_generate_uuid4')) {
-            return wp_generate_uuid4();
-        }
-
-        return uniqid('v_', true);
-    }
-
-    private function get_author_name(int $author_id): string
-    {
-        if ($author_id <= 0) {
-            return '';
-        }
-
-        $user = get_userdata($author_id);
-        if ($user && isset($user->display_name)) {
-            return (string) $user->display_name;
-        }
-
-        return '';
+        return wp_kses_post($content);
     }
 
     /**
-     * @param array<string, mixed> $version
+     * @param mixed $value
+     */
+    private function sanitize_note($value): string
+    {
+        return sanitize_text_field($this->to_string($value));
+    }
+
+    /**
+     * @param mixed $value
+     */
+    private function to_string($value): string
+    {
+        return is_scalar($value) ? (string) $value : '';
+    }
+
+    /**
+     * @param Version $version
      */
     private function format_version_meta(array $version): string
     {
         $parts = [];
 
-        if (!empty($version['created_at'])) {
-            $parts[] = $version['created_at'];
+        if ($version['created_at'] !== '') {
+            $date = mysql2date(get_option('date_format') . ' ' . get_option('time_format'), $version['created_at']);
+            $parts[] = is_string($date) && $date !== '' ? $date : $version['created_at'];
         }
 
-        if (!empty($version['author_name'])) {
+        if ($version['author_name'] !== '') {
             $parts[] = $version['author_name'];
         }
 
@@ -621,39 +584,29 @@ class VersionedContentField extends \acf_field
     }
 
     /**
-     * @param array<string, mixed> $version
+     * @param Version $version
      */
-    private function format_version_label(array $version, int $index): string
+    private function format_version_label(array $version, int $number): string
     {
         $label = sprintf(
-            /* translators: %d: version index */
-            __('Version %d', 'acf-versioned-content-field'),
-            $index + 1
+            /* translators: %d: version number, counting up from the oldest kept version */
+            __('Version %d', self::TEXT_DOMAIN),
+            $number
         );
 
-        if (!empty($version['created_at'])) {
-            $label .= ' - ' . $version['created_at'];
-        }
+        $meta = $this->format_version_meta($version);
 
-        if (!empty($version['author_name'])) {
-            $label .= ' - ' . $version['author_name'];
-        }
-
-        return $label;
+        return $meta === '' ? $label : $label . ' - ' . $meta;
     }
 
     private function trim_preview(string $content): string
     {
         $content = trim($content);
-        if ($content === '') {
-            return '';
+
+        if (mb_strlen($content) <= self::PREVIEW_LENGTH) {
+            return $content;
         }
 
-        $excerpt = substr($content, 0, 240);
-        if (strlen($content) > 240) {
-            $excerpt .= '...';
-        }
-
-        return $excerpt;
+        return mb_substr($content, 0, self::PREVIEW_LENGTH) . '...';
     }
 }
